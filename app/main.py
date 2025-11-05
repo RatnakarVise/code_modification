@@ -174,7 +174,7 @@ async def apply_change(payload: CodeChangePayload, background_tasks: BackgroundT
     return {"job_id": job_id, "status": "queued"}
 
 
-@app.get("/job_status/{job_id}")
+@app.get("/apply_change/{job_id}")
 async def job_status(job_id: str):
     """Poll job status or return file if completed."""
     job = jobs.get(job_id)
