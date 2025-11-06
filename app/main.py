@@ -65,10 +65,16 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
 # -------------------- RELEVANCE AGENT --------------------
 def run_relevance_agent(code: str, change_request: str):
     system_prompt = (
-        "You are an expert ABAP refactoring assistant. "
-        "Determine whether the change logically applies to the given code. "
-        "Respond strictly in JSON format: "
-        "{ 'relevance': 'YES' or 'NO', 'reason': '<text>' }"
+        "You are an expert SAP ABAP code reviewer. "
+        "You will determine whether a change request truly applies to a given ABAP method.\n\n"
+        "STEP 1: Summarize in one line what the method or code logically does (its purpose).\n"
+        "STEP 2: Summarize what the change request intends to modify or achieve.\n"
+        "STEP 3: Compare the two — the change applies ONLY if it directly affects the same "
+        "functional logic, event, or object that this method handles.\n"
+        "If the method merely shares similar field names or tables, but performs a different function, "
+        "it should be marked NO.\n"
+        "Output strictly in JSON format:\n"
+        "{ 'purpose': '<summary>', 'change_intent': '<summary>', 'relevance': 'YES' or 'NO', 'reason': '<short reason>' }"
     )
     user_prompt = f"CHANGE REQUEST:\n{change_request}\n\nABAP CODE:\n{code}"
 
@@ -79,6 +85,9 @@ def run_relevance_agent(code: str, change_request: str):
         parsed = json.loads(reply.replace("'", '"'))
         relevance = parsed.get("relevance", "NO").upper()
         reason = parsed.get("reason", "").strip()
+        purpose = parsed.get("purpose", "")
+        intent = parsed.get("change_intent", "")
+        logger.info(f"Purpose: {purpose} | Intent: {intent}")
     except Exception:
         if "YES" in reply.upper():
             relevance, reason = "YES", reply
