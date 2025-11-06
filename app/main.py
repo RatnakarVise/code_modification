@@ -1,6 +1,6 @@
 """
 FastAPI app — Multi-change request LLM pipeline for ABAP code modification.
-🧠 Runs Relevance + Modifier Agents per change request.
+🧠 Runs Relevance + Modifier Agents per structured change request (with code block name).
 🗂️ Generates ONE text file only if relevant changes exist.
 """
 
@@ -8,32 +8,32 @@ import os
 import io
 import uuid
 import logging
+import json
 from datetime import datetime
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from openai import OpenAI
-import json
 
 # -------------------- CONFIG --------------------
 load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("abap_multi_change")
 
-app = FastAPI(title="ABAP Multi-Change Evaluator", version="3.5")
+app = FastAPI(title="ABAP Multi-Change Evaluator", version="4.0")
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 MODEL = os.getenv("LLM_MODEL", "gpt-5")
 
 jobs = {}  # in-memory job tracker
 
+# -------------------- MODELS --------------------
+class ChangeItem(BaseModel):
+    CODE_BLOCK_NAME: str | None = None
+    CHANGE: str
 
-# -------------------- REQUEST MODEL --------------------
+
 class CodeChangePayload(BaseModel):
     PGM_NAME: str | None = None
     INC_NAME: str | None = None
@@ -42,12 +42,11 @@ class CodeChangePayload(BaseModel):
     START_LINE: str | None = None
     END_LINE: str | None = None
     CODE: str
-    CHANGE_REQUEST: list[str]
+    CHANGE_REQUEST: list[ChangeItem]
 
 
-# -------------------- LLM HELPER --------------------
+# -------------------- LLM CALL --------------------
 def call_llm(system_prompt: str, user_prompt: str) -> str:
-    """Wrapper for OpenAI LLM call."""
     try:
         response = client.chat.completions.create(
             model=MODEL,
@@ -63,20 +62,23 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
 
 
 # -------------------- RELEVANCE AGENT --------------------
-def run_relevance_agent(code: str, change_request: str):
+def run_relevance_agent(code: str, change_item: ChangeItem):
+    """Checks if the change applies to the given ABAP method."""
     system_prompt = (
         "You are an expert SAP ABAP code reviewer. "
-        "You will determine whether a change request truly applies to a given ABAP method.\n\n"
-        "STEP 1: Summarize in one line what the method or code logically does (its purpose).\n"
-        "STEP 2: Summarize what the change request intends to modify or achieve.\n"
-        "STEP 3: Compare the two — the change applies ONLY if it directly affects the same "
-        "functional logic, event, or object that this method handles.\n"
-        "If the method merely shares similar field names or tables, but performs a different function, "
-        "it should be marked NO.\n"
+        "You will determine whether a given change request applies to this ABAP method.\n\n"
+        "STEP 1: Summarize the purpose of the ABAP method.\n"
+        "STEP 2: Summarize what the change request (and its referenced code block name) intends to do.\n"
+        "STEP 3: Mark relevance YES only if the change should logically be applied to this code.\n"
         "Output strictly in JSON format:\n"
         "{ 'purpose': '<summary>', 'change_intent': '<summary>', 'relevance': 'YES' or 'NO', 'reason': '<short reason>' }"
     )
-    user_prompt = f"CHANGE REQUEST:\n{change_request}\n\nABAP CODE:\n{code}"
+
+    user_prompt = (
+        f"CODE BLOCK NAME: {change_item.CODE_BLOCK_NAME or 'N/A'}\n"
+        f"CHANGE REQUEST:\n{change_item.CHANGE}\n\n"
+        f"ABAP CODE:\n{code}"
+    )
 
     reply = call_llm(system_prompt, user_prompt)
     relevance, reason = "NO", "Parsing error"
@@ -85,21 +87,19 @@ def run_relevance_agent(code: str, change_request: str):
         parsed = json.loads(reply.replace("'", '"'))
         relevance = parsed.get("relevance", "NO").upper()
         reason = parsed.get("reason", "").strip()
-        purpose = parsed.get("purpose", "")
-        intent = parsed.get("change_intent", "")
-        logger.info(f"Purpose: {purpose} | Intent: {intent}")
+        logger.info(f"Relevance: {relevance} | Reason: {reason}")
     except Exception:
         if "YES" in reply.upper():
             relevance, reason = "YES", reply
         elif "NO" in reply.upper():
             relevance, reason = "NO", reply
 
-    logger.info(f"RelevanceAgent → {relevance}: {reason}")
     return relevance, reason
 
 
 # -------------------- MODIFIER AGENT --------------------
-def run_modifier_agent(code: str, change_request: str):
+def run_modifier_agent(code: str, change_item: ChangeItem):
+    """Modifies the ABAP code as per the relevant change request."""
     system_prompt = (
         "You are an ABAP refactoring assistant. "
         "Given a program or method and a change request, modify the code to fully implement the change. "
@@ -107,7 +107,12 @@ def run_modifier_agent(code: str, change_request: str):
         "Add ABAP comments where changes are made: 'Added by PwC<YYYYMMDD>T<HHMMSS>'. "
         "Only apply the requested change. Always return the full ABAP code."
     )
-    user_prompt = f"CHANGE REQUEST:\n{change_request}\n\nEXISTING CODE:\n{code}"
+
+    user_prompt = (
+        f"CODE BLOCK NAME: {change_item.CODE_BLOCK_NAME or 'N/A'}\n"
+        f"CHANGE REQUEST:\n{change_item.CHANGE}\n\n"
+        f"EXISTING CODE:\n{code}"
+    )
 
     return call_llm(system_prompt, user_prompt)
 
@@ -119,17 +124,22 @@ def process_job(job_id: str, payload: CodeChangePayload):
         current_code = payload.CODE
         applied_changes = []
 
-        for idx, change_req in enumerate(payload.CHANGE_REQUEST, start=1):
+        for idx, change_item in enumerate(payload.CHANGE_REQUEST, start=1):
             logger.info(f"[{job_id}] Evaluating change {idx}/{len(payload.CHANGE_REQUEST)}")
 
-            relevance, reason = run_relevance_agent(current_code, change_req)
-            result = {"index": idx, "relevance": relevance, "reason": reason}
+            relevance, reason = run_relevance_agent(current_code, change_item)
+            result = {
+                "index": idx,
+                "relevance": relevance,
+                "reason": reason,
+                "code_block": change_item.CODE_BLOCK_NAME or ""
+            }
 
             if relevance == "YES":
-                modified_code = run_modifier_agent(current_code, change_req)
+                modified_code = run_modifier_agent(current_code, change_item)
                 result["modified_code"] = modified_code
-                current_code = modified_code  # ✅ update for next iteration
-                applied_changes.append(str(idx))
+                current_code = modified_code  # ✅ Feed new version to next iteration
+                applied_changes.append(f"{idx} ({change_item.CODE_BLOCK_NAME or 'Unknown'})")
                 logger.info(f"[{job_id}] Change {idx} applied successfully.")
             else:
                 result["modified_code"] = ""
@@ -137,14 +147,14 @@ def process_job(job_id: str, payload: CodeChangePayload):
 
             jobs[job_id]["results"].append(result)
 
-        # 🧩 If no relevant changes
+        # 🧩 No applicable changes
         if not applied_changes:
             jobs[job_id]["status"] = "completed"
             jobs[job_id]["result"] = {"status": "no_change_required"}
             logger.info(f"[{job_id}] No relevant changes. No file created.")
             return
 
-        # ✅ Build final output — only final code with summary
+        # ✅ Build final combined output
         header = (
             f"*=== FINAL MODIFIED CODE ===*\n"
             f"* Applied Changes: {', '.join(applied_changes)} *\n"
@@ -153,23 +163,20 @@ def process_job(job_id: str, payload: CodeChangePayload):
         final_output = header + current_code
 
         filename = f"{payload.NAME}_modified_{datetime.now().strftime('%Y%m%dT%H%M%S')}.txt"
-
-        file_buffer = io.BytesIO(final_output.encode("utf-8"))
-        file_buffer.seek(0)
+        buffer = io.BytesIO(final_output.encode("utf-8"))
+        buffer.seek(0)
 
         jobs[job_id]["status"] = "completed"
         jobs[job_id]["result"] = {
             "status": "change_applied",
-            "file_buffer": file_buffer,
+            "file_buffer": buffer,
             "filename": filename
         }
-
-        logger.info(f"[{job_id}] Final file {filename} created with cumulative changes.")
+        logger.info(f"[{job_id}] Final file created: {filename}")
 
     except Exception as e:
         jobs[job_id] = {"status": "failed", "error": str(e)}
         logger.exception(f"[{job_id}] Job failed: %s", e)
-
 
 
 # -------------------- ENDPOINTS --------------------
@@ -205,7 +212,5 @@ async def job_status(job_id: str):
     return StreamingResponse(
         result["file_buffer"],
         media_type="text/plain",
-        headers={
-            "Content-Disposition": f"attachment; filename={result['filename']}"
-        },
+        headers={"Content-Disposition": f"attachment; filename={result['filename']}"}
     )
